@@ -1,0 +1,407 @@
+---
+title: "integration and analysis of targetSeq and 10x"
+author: "Sushma Nagaraj"
+date: "3/3/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(scran)
+  library(scater)
+  library(batchelor)
+  library(ComplexHeatmap)
+})
+here::i_am("src/Bai_Nodose_ganglion/Nodose_ganglion_integration_and_analysis.Rmd")
+source("/home/sushmanagaraj/src/devel/R/SingleCell/functions/functions.R")
+sce <- readRDS(here::here("integrated_analysis", "sce.integrated.rds"))
+```
+
+
+```{r}
+sce.target <- readRDS(here::here("targetSeq/sce.targetSeq.final.rds"))
+sce.10x <- readRDS(here::here("10x/sce.Vagal_WholeNodoseSeq_10X.final.rds"))
+```
+
+#Generate a combined dataset
+```{r}
+target.coldata <- colnames(colData(sce.target))[c(6:11, 2, 3, 20)]
+colData(sce.target) <- colData(sce.target)[,colnames(colData(sce.target)) %in% target.coldata]
+sce.target$batch <- "smartseq2"
+rowData(sce.target) <- rowData(sce.target)[,colnames(rowData(sce.target)) %in% colnames(rowData(sce.10x))]
+sce.target <- sce.target[rownames(sce.10x), ]
+
+x10.coldata <- colnames(colData(sce.10x))[3:8]
+colData(sce.10x) <- colData(sce.10x)[,colnames(colData(sce.10x)) %in% x10.coldata]
+sce.10x$`Mouse ID` <- "Pooled"
+sce.10x$`Target ID` <- NA
+sce.10x$map_to_Bai_refined <- NA
+sce.10x$batch <- "10x"
+colData(sce.10x) <- colData(sce.10x)[,colnames(colData(sce.target))]
+all.equal(colnames(colData(sce.target)), colnames(colData(sce.10x)))
+all.equal(rownames(sce.target), rownames(sce.10x))
+
+sce_list <- vector("list", 2)
+sce_list[[1]] <- SingleCellExperiment(assays = list(counts = counts(sce.target), logcounts = logcounts(sce.target)), colData = colData(sce.target), rowData = rowData(sce.target))
+sce_list[[2]] <- SingleCellExperiment(assays = list(counts = counts(sce.10x), logcounts = logcounts(sce.10x)), colData = colData(sce.10x), rowData = rowData(sce.10x))
+sce <- do.call(cbind, sce_list)
+sce$batch <- factor(sce$batch)
+```
+
+# Variance modelling
+```{r variance_modelling}
+dec <- modelGeneVar(sce, block = sce$batch)
+
+chosen.hvgs <- getTopHVGs(dec, prop = 0.2)
+blocked.stats <- dec$per.block
+
+for (i in colnames(blocked.stats)) {
+  current <- blocked.stats[[i]]
+  hv <- current[current$total >= 1, ]
+  plot(current$mean, current$total, main = i, pch = 16, cex = 0.5, xlab = "Mean of log-expression", ylab = "Variance of log-expression")
+  text(hv$mean, hv$total, row.names(hv), cex = 0.7)
+  curfit <- metadata(current)
+  curve(curfit$trend(x), col = "dodgerblue", add = TRUE, lwd = 2)
+}
+
+glial_genes <- read.table(here::here("10x", "cluster.k10", "glial_genes.cluster9.txt"))
+chosen.hvgs <- chosen.hvgs[!chosen.hvgs %in% glial_genes$x]
+
+
+```
+
+```{r batch correction}
+set.seed(0010101010)
+uncorrected <- runPCA(sce, subset_row = chosen.hvgs, BSPARAM = BiocSingular::RandomParam()) 
+percent.var <- attr(reducedDim(uncorrected), "percentVar")
+chosen.elbow <- PCAtools::findElbowPoint(percent.var)
+plot(percent.var, xlab = "PC", ylab = "Variance explained (%)")
+abline(v=chosen.elbow, col = "red")
+snn.gr.uncorr <- buildSNNGraph(uncorrected, use.dimred = "PCA")
+clusters.uncorr <- igraph::cluster_walktrap(snn.gr.uncorr)$membership
+tab.uncorr <- table(Cluster = clusters.uncorr, Batch = uncorrected$batch)
+tab.uncorr
+
+set.seed(1111001)
+uncorrected <- runTSNE(uncorrected, dimred = "PCA")
+plotTSNE(uncorrected, colour_by = "batch")
+
+set.seed(1000101001)
+mnn.out <- fastMNN(sce, subset.row = chosen.hvgs, d = 50, batch = sce$batch, BSPARAM = BiocSingular::RandomParam(deferred = TRUE))
+snn.gr <- buildSNNGraph(mnn.out, use.dimred = "corrected")
+clusters.mnn <- igraph::cluster_walktrap(snn.gr)$membership
+tab.mnn <- table(Cluster = clusters.mnn, Batch = mnn.out$batch)
+tab.mnn
+
+set.seed(1111001)
+mnn.out <- runTSNE(mnn.out, dimred = "corrected")
+plotTSNE(mnn.out, colour_by = "batch") + ggtitle("MNN batch correction")
+
+pdf(here::here("integrated_analysis", "batch_correction.pdf"))
+plotTSNE(uncorrected, colour_by = "batch") + ggtitle("batch effects")
+plotTSNE(mnn.out, colour_by = "batch") + ggtitle("MNN batch correction")
+dev.off()
+
+# proportion of variance lost
+metadata(mnn.out)$merge.info$lost.var
+
+reducedDim(sce, "corrected") <- reducedDim(mnn.out, "corrected")
+```
+
+
+```{r}
+set.seed(00101010)
+sce <- runTSNE(sce, dimred = "corrected")
+plotTSNE(sce, colour_by = "batch")
+
+set.seed(1100101001)
+sce <- runUMAP(sce, dimred = "corrected")
+plotUMAP(sce, colour_by = "batch")
+
+pdf(here::here("integrated_analysis", "TSNE.pdf"))
+plotTSNE(sce, colour_by = "batch")
+plotTSNE(sce, colour_by = "Target ID")
+plotTSNE(sce, colour_by = "map_to_Bai_refined")
+dev.off()
+```
+#Clustering
+```{r}
+g <- buildSNNGraph(sce, k = 3, use.dimred = "corrected")
+clust <- igraph::cluster_louvain(g)$membership
+table(clust)
+sce$cluster.k3 <- factor(clust)
+
+plotTSNE(sce, colour_by = "cluster.k3", text_by = "cluster.k3")
+```
+#Marker genes
+```{r}
+pdf(here::here("integrated_analysis", "cluster.k3", "marker_genes.violin_plots.pdf"), width = 10)
+plotExpression(sce, features = c("Mafb", "Rbp2", "Rbp4", "Bmp8a", "Grm3", "Slc18a3", "Lamp5", "Pdk4", "Gpr65", "Edn3", "Dbh", "Gpc3", "Gprin3", "Sst", "Npas1", "Ctla2a", "Sctr", "Rnf128", "Rtp1", "Rspo1", "Smco4", "Obscn", "Aldh1a3", "Nkd1", "Lypd6", "Prdm12"), x = I(as.factor(sce$cluster.k3)), colour_by = I(as.factor(sce$cluster.k3)), point_size = 0, show_violin = TRUE)
+dev.off()
+
+lapply(c("Mafb", "Rbp2", "Rbp4", "Bmp8a", "Grm3", "Slc18a3", "Lamp5", "Pdk4", "Gpr65", "Edn3"), function(g) {
+  plotTSNE(sce, colour_by = g)
+})
+
+sce$annotation <- "unknown"
+sce$annotation[sce$cluster.k3 == 18] <- "n1.n27"
+sce$annotation[sce$cluster.k3 == 26] <- "n2"
+sce$annotation[sce$cluster.k3 %in% c(4, 20, 25)] <- "n3"
+sce$annotation[sce$cluster.k3 == 21] <- "n4"
+sce$annotation[sce$cluster.k3 == 5] <- "n5"
+sce$annotation[sce$cluster.k3 %in% c(23, 24)] <- "n6"
+sce$annotation[sce$cluster.k3 == 22] <- "n7"
+sce$annotation[sce$cluster.k3 %in% c(28,29)] <- "n8"
+sce$annotation[sce$cluster.k3 == 9] <- "n10"
+sce$annotation[sce$cluster.k3 == 7] <- "n11"
+sce$annotation[sce$cluster.k3 == 8] <- "n12"
+sce$annotation[sce$cluster.k3 == 11] <- "n13"
+sce$annotation[sce$cluster.k3 == 12] <- "n9"
+sce$annotation[sce$cluster.k3 == 10] <- "n16"
+sce$annotation[sce$cluster.k3 == 13] <- "n17.n18"
+sce$annotation[sce$cluster.k3 %in% c(15, 17)] <- "n19"
+sce$annotation[sce$cluster.k3 == 6] <- "n20"
+sce$annotation[sce$cluster.k3 %in% c(16, 27)] <- "n21"
+sce$annotation[sce$cluster.k3 == 19] <- "n22"
+sce$annotation[sce$cluster.k3 == 3] <- "n23"
+sce$annotation[sce$cluster.k3 == 14] <- "n24"
+sce$annotation[sce$cluster.k3 == 2] <- "n25"
+sce$annotation[sce$cluster.k3 == 1] <- "n14.n26"
+#Unsure where n15 is.
+
+colors <- c('#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4', '#46f0f0', '#f032e6', '#bcf60c', '#fabebe', '#008080', '#e6beff', '#9a6324', '#046c9a', '#800000', '#cc3a1b', '#808000', '#4cabdc', '#808080', '#ebcb2e', '#00ccff', "#ebcb2e", "#9ec22f", "#a9961b", "#cc3a1b", "#cc8778", "#999999", "#E69F00", "#56B4E9", "#009E73")
+
+pdf(here::here("integrated_analysis", "cluster.k3", "TSNE.annotated.pdf"), width = 10)
+cowplot::plot_grid(
+plotTSNE(sce, colour_by = "annotation", text_by = "annotation", point_alpha = 1, point_size = 0.7, text_size = 4) + scale_color_manual(values = colors),
+plotTSNE(sce, colour_by = "Target ID", text_by = "annotation", point_size = 0.7, point_alpha = 0.6),
+plotTSNE(sce, colour_by = "map_to_Bai_refined", text_by = "annotation", point_size = 0.7, point_alpha = 0.6),
+ncol = 2
+)
+dev.off()
+
+pdf(here::here("integrated_analysis", "cluster.k3", "interesting_genes.tsne.pdf"), height = 10, width = 10)
+gridExtra::grid.arrange(
+grobs = lapply(c("Calca", "Sst", "Gpr65", "Vip", "Uts2b", "Scn10a", "Fxyd2", "Fxyd7", "Cartpt"), function(g) {
+  plotTSNE(sce, colour_by = g, point_size = 0.5, point_alpha = 0.6, text_by = "annotation", text_size = 4)
+}),
+ncol = 3
+)
+dev.off()
+
+plotTSNE(sce, colour_by = "Gabra5", point_size = 1, text_by = "annotation", point_alpha = 0.8) + scale_color_gradient(low = "grey", high = "red")
+plotExpression(sce, features = c("Gabra5"), x = I(as.factor(sce$annotation)), colour_by = I(as.factor(sce$annotation)), point_size = 0.5, show_violin = TRUE) + theme(axis.text.x = element_text(angle = 90))
+
+plotTSNE(sce, colour_by = "Etv1", point_size = 1, text_by = "annotation", point_alpha = 0.8) 
+plotTSNE(sce[,sce$batch == "10x"], colour_by = "Rab15", point_size = 1, text_by = "annotation", point_alpha = 0.8) 
+```
+
+#which clusters contain the gastric projecting and other subdiaphragmatic projecting neurons?
+```{r}
+dat <- unclass(table(sce$`Target ID`, sce$annotation))
+rownames(dat)[rownames(dat) == "na"] <- "Non-Specific"
+dat_sums <- colSums(dat)
+sums <- unclass(table(sce$annotation))
+all.equal(names(sums), colnames(dat))
+na <- sums - dat_sums
+dat <- rbind(dat, na)
+tab <- sweep(dat, 2, STATS = sums, FUN = "/") * 100
+#tab <- dat
+
+barplot(tab)
+
+tab_melt <- reshape2::melt(tab)
+colnames(tab_melt) <- c("Target", "Cluster", "Cells")
+tab_melt$Target <- factor(tab_melt$Target, levels = c("GastG", "GastP", "IntP", "IntM", "IntD", "IntL", "Port", "Non-Specific", "na"))
+pdf(here::here("integrated_analysis", "cluster.k3", "cluster_composition.pdf"))
+ggplot(tab_melt, aes(x = Cluster, y = Cells, fill = Target)) + geom_col() + scale_fill_brewer(palette = "Set3") + theme_classic() + theme(axis.text.x = element_text(angle = 90)) + ylab("No. of cells")
+dev.off()
+
+ggplot(tab_melt, aes(x = Cluster, y = Cells, fill = Target)) + geom_col() + scale_fill_brewer(palette = "Set3") + theme_classic() + theme(axis.text.x = element_text(angle = 90)) + ylab("percentage of cells")
+
+sce$region_projecting <- "Subdiaphragmatic"
+sce$region_projecting[sce$annotation %in% c("n1.n27", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n21")] <- "Supradiaphragmatic"
+
+plotTSNE(sce, colour_by = "region_projecting", text_by = "annotation")
+```
+
+#Find Marker genes for the subdiaphragmatic clusters.
+```{r marker_genes}
+sce.subd <- sce[,sce$region_projecting == "Subdiaphragmatic"]
+markers <- findMarkers(sce.subd, sce.subd$annotation, block = sce.subd$batch, BPPARAM = BiocParallel::MulticoreParam(5))
+
+genes5 <- lapply(markers, function(x) {rownames(x)[x$Top <= 10]})
+genes5 <- unique(unlist(genes5))
+
+pdf(here::here("integrated_analysis", "cluster.k3", "markers_heatmap.pdf"))
+plotHeatmap(sce, genes5, colour_columns_by = c("annotation"), show_colnames = FALSE, clustering_method = 'ward.D2', fontsize_row = 2)
+dev.off()
+
+lapply(names(markers), function(x) {
+  c <- markers[[x]]
+  c0.05 <- c[c$FDR < 0.05, ]
+  write.csv(c0.05, file = here::here("integrated_analysis", "cluster.k3", paste0("cluster.", x, ".marker_genes.FDR0.05.csv")))
+  write.csv(c, file = here::here("integrated_analysis", "cluster.k3", paste0("cluster.", x, ".findMarkers.csv")))
+})
+
+top <- vector("list", length(markers))
+top <- lapply(names(markers), function(x) {
+  c <- markers[[x]]
+  c150 <- c[1:150, 3:4]
+  c150$Gene <- rownames(c150)
+  rownames(c150) <- NULL
+  c150 <- c150[,c("Gene", "FDR", "summary.logFC")]
+  return(c150)
+}) 
+names(top) <- names(markers)
+topgenes <- do.call("cbind", top)
+write.csv(topgenes, file = here::here("integrated_analysis", "cluster.k3", "topgenes_subdiaphragmatic_clusters.csv"))
+
+```
+#Find top differentially expressed genes between sub and supra diaphragmatic clusters
+```{r}
+markers.2 <- findMarkers(sce, sce$region_projecting, block = sce$batch, BPPARAM = BiocParallel::MulticoreParam(5))
+subd.markers <- markers.2[["Subdiaphragmatic"]]
+subd.markers <- subd.markers[subd.markers$FDR <= 0.05 & abs(subd.markers$summary.logFC) >=1, ]
+subd.markers.gastric <- subd.markers[rownames(subd.markers) %in% patt$genes[abs(patt$logFC) >=1], ]
+
+col_order <- c("n1.n27", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n21", "n14.n26", "n25", "n9", "n10", "n11", "n12", "n13", "n16", "n17.n18", "n19", "n20", "n22", "n23", "n24")
+col <- c('#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4', '#46f0f0', '#f032e6', '#bcf60c', '#fabebe', '#008080', '#e6beff', '#9a6324', '#046c9a', '#800000', '#cc3a1b', '#808000', '#4cabdc', '#808080', '#ebcb2e', '#00ccff', "#ebcb2e", "#9ec22f", "#a9961b", "#cc3a1b", "#cc8778", "#999999", "#E69F00", "#56B4E9", "#009E73")
+cluster_colors <- col[1:length(col_order)]
+names(cluster_colors) <- col_order
+
+#Heatmap of expression averaged over clusters
+sce.10x$annotation <- factor(sce.10x$annotation, levels = col_order)
+avgs <- vector("list", length = length(levels(sce.10x$annotation)))
+avgs <- lapply(levels(sce.10x$annotation), function(x) {clustAvg(x, sce.10x, "annotation")})
+merged <- Reduce(function(x, y) merge(x, y, all = TRUE, by = "gene"), avgs)
+
+rownames(merged) <- merged$gene
+mat <- merged[rownames(merged) %in% rownames(subd.markers.gastric), grep("Avg", colnames(merged))]
+colnames(mat) <- gsub("Avg.", "", colnames(mat))
+mat <- as.matrix(mat)
+mat <- log2(mat)
+mat <- t(scale(t(mat)))
+
+sc.FC <- subd.markers.gastric$summary.logFC
+names(sc.FC) <- rownames(subd.markers.gastric)
+sc.FC <- sc.FC[order(sc.FC, decreasing = TRUE)]
+pr.FC <- patt$logFC
+names(pr.FC) <- patt$genes
+pr.FC <- pr.FC[names(pr.FC) %in% names(sc.FC)]
+pr.FC <- pr.FC[names(sc.FC)]
+mat <- mat[names(sc.FC), ]
+all.equal(names(sc.FC), names(pr.FC), rownames(mat))
+
+column_ha <- HeatmapAnnotation(clusters = factor(colnames(mat), levels = col_order), region_projected = rep(c("Supradiaphragmatic", "Subdiaphragmatic"), c(9, 14)), col = list(clusters = cluster_colors, region_projected = c(Supradiaphragmatic = "#daa520", Subdiaphragmatic = "CornflowerBlue")))
+
+pdf(here::here("integrated_analysis", "cluster.k3", "DE_genes_between_supra_sub_diaphragmatic.also_DE_in_gastric_vs_distal_prot.pdf"), height = 16)
+Heatmap(mat, name = "log2.clusterAvg", cluster_columns = FALSE, cluster_rows = FALSE, show_column_names = FALSE, top_annotation = column_ha, row_names_gp = gpar(fontsize = 4), show_row_dend = FALSE, column_title = "Nodose 10x clusters") + Heatmap(sc.FC, name = "sc.FC", row_names_gp = gpar(fontsize = 4)) + Heatmap(pr.FC, name = "Proteomics.FC", row_names_gp = gpar(fontsize = 4))
+dev.off()
+
+ggplot(data.frame(sc.FC, pr.FC), aes(x = sc.FC, y = pr.FC)) + geom_point()
+cor(sc.FC, pr.FC)
+
+comp <- data.frame(sign(sc.FC), sign(pr.FC))
+table(comp$sign.sc.FC. + comp$sign.pr.FC.)
+```
+
+```{r}
+library(projectR)
+mydat <- logcounts(sce)
+mydat <- as.matrix(mydat)
+mydat <- mydat[rowSums(mydat) != 0, ]
+
+patt <- read.csv(here::here("data", "Gastric-vs-Distal.DE.gt2peptide.csv"), header = TRUE)
+table(duplicated(patt$genes))
+patt <- patt[!duplicated(patt$genes), ]
+pattern <- as.matrix(patt$logFC)
+rownames(pattern) <- patt$genes
+colnames(pattern) <- "Gas.Dis"
+NMF2SC <- projectR(mydat, loadings = pattern, full=TRUE)
+
+sce$Gas.Dis.projection.weight <- NMF2SC$projection
+plotTSNE(sce, colour_by = "Gas.Dis.projection.weight", text_by = "annotation")
+
+proj <- as.data.frame(colData(sce)[,c("annotation", "Gas.Dis.projection.weight", "region_projecting")])
+ggplot(proj, aes(x = annotation, y = Gas.Dis.projection.weight, col = region_projecting)) + geom_boxplot() + theme(axis.text.x = element_text(angle = 90))
+
+projection_drivers <- projectionDriveR(mydat[,sce$region_projecting == "Subdiaphragmatic"], mydat[,sce$region_projecting == "Supradiaphragmatic"], loadings = pattern, pattern_name = "Gas.Dis")
+
+pattern.onehot <- ifelse(pattern[,1] > 0, 1, 0) 
+pattern.onehot <- as.matrix(pattern.onehot)
+colnames(pattern.onehot) <- "Gas.Dis"
+NMF2SC.onehot <- projectR(mydat, loadings = pattern.onehot, full=TRUE)
+
+sce$pattern.onehot.Gas.Dis.projection.weight <- NMF2SC.onehot$projection
+plotTSNE(sce, colour_by = "pattern.onehot.Gas.Dis.projection.weight")
+proj.onehot <- as.data.frame(colData(sce)[,c("annotation", "pattern.onehot.Gas.Dis.projection.weight", "region_projecting")])
+
+ggplot(proj, aes(x = annotation, y = Gas.Dis.projection.weight, col = region_projecting)) + geom_boxplot() + theme(axis.text.x = element_text(angle = 90))
+ggplot(proj.onehot, aes(x = annotation, y = pattern.onehot.Gas.Dis.projection.weight, col = region_projecting)) + geom_boxplot() + theme(axis.text.x = element_text(angle = 90))
+plotTSNE(sce, colour_by = "pattern.onehot.Gas.Dis.projection.weight", text_by = "annotation")
+
+gas_genes <- pattern[pattern > 0, ]
+gas_genes <- gas_genes[names(gas_genes) %in% rownames(sce)]
+plotHeatmap(sce, names(gas_genes), colour_columns_by = c("cluster.k5"), show_colnames = FALSE, clustering_method = 'ward.D2', fontsize_row = 2)
+```
+#AUCell
+```{r}
+#The cells from the 2 datasets have different distributions of genes detected
+ggplot(as.data.frame(colData(sce)), aes(x = detected, fill = batch)) + geom_density()
+ggplot(as.data.frame(colData(sce)), aes(x = log2(sum + 1), fill = batch)) + geom_density()
+
+#Differentially expressed proteins in Gastric-vs-Nodose comparison
+patt <- read.csv(here::here("data", "Gastric-vs-Nodose.DE.gt2peptide.csv"), header = TRUE)
+table(duplicated(patt$genes))
+patt <- patt[!duplicated(patt$genes), ]
+pattern <- as.matrix(patt$logFC)
+rownames(pattern) <- patt$genes
+colnames(pattern) <- "Gas.Nod"
+genes <- rownames(pattern)[pattern > 0]
+
+mydat <- logcounts(sce)
+mydat <- as.matrix(mydat)
+mydat <- mydat[rowSums(mydat) != 0, ]
+
+library(AUCell)
+geneSets <- list(Gastric = genes) 
+cells_rankings <- AUCell_buildRankings(mydat[,sce$batch == "10x"], nCores=1, plotStats=TRUE)
+cells_AUC <- AUCell_calcAUC(geneSets, cells_rankings, aucMaxRank = ceiling(0.30 * nrow(cells_rankings)))
+#cells_assignment <- AUCell_exploreThresholds(cells_AUC, plotHist=TRUE, assign=TRUE) 
+
+sce.10x <- sce[,sce$batch == "10x"]
+AUC <- getAUC(cells_AUC)
+all.equal(colnames(AUC), colnames(sce.10x))
+sce.10x$AUCell <- AUC
+
+
+aucdat <- as.data.frame(colData(sce.10x)[,c("annotation", "region_projecting", "AUCell")])
+pdf(here::here("integrated_analysis", "cluster.k3", "AUC.Gastric-vs-Nodose.DE_genes.10x.pdf"))
+plotTSNE(sce.10x, colour_by = "AUCell")
+ggplot(aucdat, aes(x = AUCell, fill = region_projecting)) + geom_density(alpha = 0.4) 
+ggplot(aucdat, aes(x = annotation, y = AUCell, col = region_projecting)) + geom_boxplot() + theme(axis.text.x = element_text(angle = 90))
+ggplot(aucdat, aes(x = region_projecting, y = AUCell, col = region_projecting)) + geom_boxplot() + theme(axis.text.x = element_text(angle = 90))
+dev.off()
+
+sce.target <- sce[,sce$batch == "smartseq2"]
+target.cells_rankings <- AUCell_buildRankings(mydat[,sce$batch == "smartseq2"], nCores=1, plotStats=TRUE)
+target.cells_AUC <- AUCell_calcAUC(geneSets, target.cells_rankings, aucMaxRank = ceiling(0.30 * nrow(cells_rankings)))
+target.AUC <- getAUC(target.cells_AUC)
+all.equal(colnames(target.AUC), colnames(sce.target))
+sce.target$AUCell <- target.AUC
+target.aucdat <- as.data.frame(colData(sce.target)[,c("annotation", "region_projecting", "AUCell", "Target ID")])
+pdf(here::here("integrated_analysis", "cluster.k3", "AUC.Gastric-vs-Nodose.DE_genes.smartseq2.pdf"))
+plotTSNE(sce.target, colour_by = "AUCell")
+ggplot(target.aucdat, aes(x = annotation, y = AUCell, fill = region_projecting)) + geom_boxplot() + theme(axis.text.x = element_text(angle = 90))
+ggplot(target.aucdat, aes(x = Target.ID, y = AUCell)) + geom_boxplot() + theme(axis.text.x = element_text(angle = 90))
+dev.off()
+
+```
+
+```{r}
+saveRDS(sce, here::here("integrated_analysis", "sce.integrated.rds"))
+```
+

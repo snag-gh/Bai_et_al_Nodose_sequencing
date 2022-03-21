@@ -1,0 +1,279 @@
+---
+title: "Nodose ganglion 10X analysis"
+author: "Sushma Nagaraj"
+date: "3/2/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressPackageStartupMessages({ 
+  library(scater)
+  library(scran)
+  library(tximeta)
+  library(SingleCellExperiment) 
+  library(DropletUtils)
+  library(Matrix)
+  library(cowplot)
+  library(stringr)
+  })
+
+here::i_am("src/Bai_Nodose_ganglion/Nodose_ganglion_10X_analysis.Rmd")
+```
+
+#Read in salmon quantification
+```{r}
+quant <- "/data/users/sushmanagaraj/projects/singlecell/Bai_Nodose_ganglion/salmon/SRR10252343/alevin/quants_mat.gz"
+sce <- tximeta(coldata = data.frame(files = quant, names = "Vagal_WholeNodoseSeq_10X"),  type = "alevin", skipSeqinfo = TRUE)
+sce <- as(sce, "SingleCellExperiment")
+sce$sample <- "Vagal_WholeNodoseSeq_10X"
+sce$barcode <- rownames(colData(sce))
+sce_list[[samples[i]]] <- sce
+```
+#Add gene metadata
+```{r}
+rowData(sce)$chr <- as.character(seqnames(rowRanges(sce)))
+
+my_file <- "/data/users/sushmanagaraj/ref/mm/vM25/gencode.vM25.annotation.gtf"
+my_obj <- import(my_file)
+temp <- my_obj@elementMetadata
+gn <- temp[temp$type == "gene", c("gene_id", "gene_name")]
+rowData(sce)$gene_name <- gn[match(rowData(sce)$gene_id, gn$gene_id), "gene_name"]
+rowData(sce)$gene_id_trimmed <- str_sub(rowData(sce)$gene_id, 1, 18) 
+
+rownames(sce) <- uniquifyFeatureNames(rowData(sce)$gene_id_trimmed, rowData(sce)$gene_name)
+
+saveRDS(sce, here::here("data", "sce.Vagal_WholeNodoseSeq_10X.rds"))
+```
+
+#Knee plot
+```{r}
+bcrank <- barcodeRanks(counts(sce))
+all(rownames(bcrank) == colnames(sce))
+knee <- metadata(bcrank)$knee
+inflection <- metadata(bcrank)$inflection
+umi.ge.knee <- sum(bcrank$total >= knee)
+umi.ge.500 <- sum(bcrank$total >= 500)
+umi.ge.inflection <- sum(bcrank$total >= inflection)
+bcrank <- as.data.frame(bcrank)
+pdf(here::here("10x", "knee_plot.pdf"))
+ggplot(bcrank, aes(x = rank, y = total)) + geom_point(size = 0.5, show.legend = TRUE) + scale_x_continuous(trans = "log10") + scale_y_continuous(trans = "log10") + geom_hline(mapping = aes(yintercept = knee, fill = "Knee"), linetype = "dashed", size = 0.5, color = "dodgerblue") + geom_hline(mapping = aes(yintercept = inflection, fill = "Inflection"), linetype = "dashed", size = 0.5, color = "darkgreen") + geom_hline(mapping = aes(yintercept = 500, fill = "500UMI"), linetype = "dashed", size = 0.5, color = "orange") + scale_fill_manual("UMI", values = rep(1,3), guide=guide_legend(override.aes = list(colour=c("orange", "darkgreen", "dodgerblue")))) + labs(x = "Rank", y= "Total UMI count", title = paste0(sce$sample[1], " Knee=", umi.ge.knee, ",", round(knee), "; Inflection=", umi.ge.inflection, ",", round(inflection), "; ", umi.ge.500, ",", "500")) + theme_bw()
+dev.off()
+```
+#QC
+```{r}
+is.mito <- which(rowData(sce)$chr == "chrM")
+sce <- addPerCellQC(sce, subsets = list(Mito = is.mito))
+stats <- colData(sce)
+
+reasons <- quickPerCellQC(stats, percent_subsets=c("subsets_Mito_percent"))
+colSums(as.data.frame(reasons))
+sce$discard <- reasons$discard
+
+qc.detected <- isOutlier(stats$detected, nmads = 5.5, type = "lower", log = TRUE)
+attr(qc.detected, "thresholds")
+qc.mito <- isOutlier(stats$subsets_Mito_percent, nmads = 3.25, type = "higher", log = FALSE)
+attr(qc.mito, "thresholds")
+qc.new <- qc.detected | qc.mito
+sce$qc.new <- qc.new
+
+pdf(here::here("10x", "qc_plots.pdf"))
+plot_grid(
+plotColData(sce, "sum", colour_by = "discard"),
+plotColData(sce, "detected", colour_by = "discard"),
+plotColData(sce, "subsets_Mito_percent", colour_by = "discard"),
+plotColData(sce, x = "detected", y = "subsets_Mito_percent", colour_by = "discard"),
+
+plotColData(sce, "sum", colour_by = "qc.new"),
+plotColData(sce, "detected", colour_by = "qc.new"),
+plotColData(sce, "subsets_Mito_percent", colour_by = "qc.new"),
+plotColData(sce, x = "detected", y = "subsets_Mito_percent", colour_by = "qc.new"), nrow = 4, ncol = 2)
+dev.off()
+
+sce <- sce[,!sce$qc.new]
+```
+
+#Normalization
+```{r normalization}
+sce <- computeSumFactors(sce)
+sce <- logNormCounts(sce)
+summary(sizeFactors(sce))
+plot(librarySizeFactors(sce), sizeFactors(sce), pch = 16, xlab = "library size factors", ylab = "Deconvolution factors", log = "xy")
+```
+
+#Variance modeling
+```{r}
+dec <- modelGeneVar(sce)
+hv <- dec[dec$total >= 1, ]
+plot(dec$mean, dec$total, pch = 16, cex = 0.5, xlab = "Mean of log-expression", ylab = "Variance of log-expression")
+text(hv$mean, hv$total, row.names(hv), cex = 0.7)
+curfit <- metadata(dec)
+curve(curfit$trend(x), col = "dodgerblue", add = TRUE, lwd = 2)
+
+chosen.hvgs <- getTopHVGs(dec, prop = 0.2)
+```
+
+#Dimentionality reduction
+```{r}
+sce <- runPCA(sce, subset_row = chosen.hvgs) 
+
+set.seed(1111001)
+sce <- runTSNE(sce, dimred = "PCA")
+tsne <- plotTSNE(sce)
+
+set.seed(1100101001)
+sce <- runUMAP(sce, dimred = "PCA")
+umap <- plotUMAP(sce)
+
+pdf(here::here("10x", "TSNE_UMAP.pdf"))
+cowplot::plot_grid(tsne, umap, nrow = 2)
+dev.off()
+```
+
+#Clustering
+```{r clustering}
+g <- buildSNNGraph(sce, k = 10, use.dimred = "PCA")
+clust <- igraph::cluster_louvain(g)$membership
+table(clust)
+sce$cluster.k10 <- factor(clust)
+
+plotTSNE(sce, colour_by = "cluster.k10", text_by = "cluster.k10")
+```
+#Marker genes
+```{r}
+plotTSNE(sce, colour_by = "Snap25")
+plotTSNE(sce, colour_by = "Plp1")
+plotTSNE(sce, colour_by = "Ecscr")
+plotTSNE(sce, colour_by = "Apoe")
+plotTSNE(sce, colour_by = "Fabp7")
+plotTSNE(sce, colour_by = "Chic1")
+
+pdf(here::here("10x", "cluster.k10", "TSNE_UMAP.clusters.pdf"))
+plotTSNE(sce, colour_by = "cluster.k10", text_by = "cluster.k10")
+plotUMAP(sce, colour_by = "cluster.k10", text_by = "cluster.k10")
+dev.off()
+
+pdf(here::here("10x", "cluster.k10", "marker_genes.violin_plots.pdf"))
+plotExpression(sce, features = c("Apoe", "Fabp7", "Dbi", "Plp1", "Sox10", "Emcn", "Ecscr", "Cdh5", "Igfbp7", "Sox18", "Nefl", "Nefm", "Snap25", "Tubb3", "Uchl1"), x = I(as.factor(sce$cluster.k10)), colour_by = I(as.factor(sce$cluster.k10)))
+dev.off()
+```
+
+
+#Find Marker genes
+```{r marker_genes}
+markers <- findMarkers(sce, sce$cluster.k10, direction = "up")
+
+genes5 <- lapply(markers, function(x) {rownames(x)[x$Top <= 5]})
+genes5 <- unique(unlist(genes5))
+
+pdf(here::here("10x", "cluster.k10", "markers_heatmap.pdf"))
+plotHeatmap(sce, genes5, colour_columns_by = c("cluster.k10"), show_colnames = FALSE, clustering_method = 'ward.D2', fontsize_row = 2)
+dev.off()
+
+glial_genes <- rownames(markers[[9]])[1:1000]
+write.table(glial_genes, file = here::here("10x", "cluster.k10", "glial_genes.cluster9.txt"))
+```
+
+#Remove non-neuronal clusters and other low quality cells
+```{r}
+sce <- sce[,!sce$cluster.k10 %in% c("9", "10", "11")]
+
+plotColData(sce, x = "detected", y = "subsets_Mito_percent", colour_by = "cluster.k10")
+plotColData(sce, x = "detected", y = "sum", colour_by = "cluster.k10")
+plot(density(sce$detected))
+plot(density(sce$subsets_Mito_percent))
+plotTSNE(sce, colour_by = "cluster.k10", text_by = "cluster.k10")
+plotTSNE(sce, colour_by = "detected", text_by = "cluster.k10")
+
+detected.discard <- sce$detected < 6000
+sce$detected.discard <- detected.discard
+sce <- sce[,!sce$detected.discard]
+
+#For use in data integration
+dec <- modelGeneVar(sce)
+hv <- dec[dec$total >= 1, ]
+plot(dec$mean, dec$total, pch = 16, cex = 0.5, xlab = "Mean of log-expression", ylab = "Variance of log-expression")
+text(hv$mean, hv$total, row.names(hv), cex = 0.7)
+curfit <- metadata(dec)
+curve(curfit$trend(x), col = "dodgerblue", add = TRUE, lwd = 2)
+
+saveRDS(dec, here::here("10x", "dec.Vagal_WholeNodoseSeq_10X.final.rds"))
+```
+
+#Annotate neuron clusters using Bai et al markers
+```{r}
+plotTSNE(sce, colour_by = "cluster.k5", text_by = "cluster.k5")
+plotTSNE(sce, colour_by = "Gpr65", text_by = "cluster.k5")
+plotTSNE(sce, colour_by = "Sst", text_by = "cluster.k5")
+plotTSNE(sce, colour_by = "Vip", text_by = "cluster.k5")
+plotTSNE(sce, colour_by = "Uts2b", text_by = "cluster.k5")
+plotTSNE(sce, colour_by = "Gpc3", text_by = "cluster.k5")
+plotTSNE(sce, colour_by = "Glp1r", text_by = "cluster.k5")
+plotTSNE(sce, colour_by = "Slc18a3", text_by = "cluster.k5")
+plotTSNE(sce, colour_by = "Calca", text_by = "cluster.k5")
+plotTSNE(sce, colour_by = "Nkd1", text_by = "cluster.k5")
+
+pdf(here::here("10x", "cluster.k5", "sub_diaphragmatic_marker_genes.violin_plots.pdf"))
+plotExpression(sce, features = c("Glp1r", "Gpr65", "C1ql3", "Ctxn2", "Agtr1a", "Oxtr", "Olfr78", "Npas1", "Sst", "Calca", "Vip", "Uts2b", "Cbln4", "Prom1", "Lpar3", "Areg", "Caln1", "Edn3", "Disp3", "Dbh", "Crhr2", "Ebf3"), x = I(as.factor(sce$cluster.k5)), colour_by = I(as.factor(sce$cluster.k5)), point_size = 0, show_violin = TRUE)
+dev.off()
+
+pdf(here::here("10x", "cluster.k5", "marker_genes.violin_plots.pdf"), height = 10)
+plotExpression(sce, features = c("Mafb", "Rbp2", "Rbp4", "Bmp8a", "Grm3", "Slc18a3", "Lamp5", "Pdk4", "Gpr65", "Edn3", "Dbh", "Gpc3", "Gprin3", "Sst", "Npas1", "Ctla2a", "Sctr", "Rnf128", "Rtp1", "Rspo1", "Smco4", "Obscn", "Aldh1a3", "Nkd1", "Lypd6", "Prdm12", "Calca", "Vip", "Uts2b", "Oxtr"), x = I(as.factor(sce$cluster.k5)), colour_by = I(as.factor(sce$cluster.k5)), point_size = 0, show_violin = TRUE)
+dev.off()
+
+sce$annotation <- "Subdiaphragmatic"
+sce$annotation[sce$cluster.k5 == 7] <- "Supradiaphragmatic"
+sce$annotation[sce$cluster.k5 == 6] <- "Supradiaphragmatic"
+sce$annotation[sce$cluster.k5 == 4] <- "Supradiaphragmatic"
+sce$annotation[sce$cluster.k5 == 12] <- "Supradiaphragmatic"
+sce$annotation[sce$cluster.k5 == 2] <- "Supradiaphragmatic"
+sce$annotation[sce$cluster.k5 == 8] <- "Supradiaphragmatic"
+
+plotTSNE(sce, colour_by = "cluster.k5", text_by = "cluster.k5")
+plotTSNE(sce, colour_by = "annotation", text_by = "cluster.k5")
+```
+```{r}
+library(projectR)
+mydat <- logcounts(sce)
+mydat <- as.matrix(mydat)
+
+patt <- read.csv(here::here("data", "Gastric-vs-Distal.DE.gt2peptide.csv"), header = TRUE)
+table(duplicated(patt$genes))
+patt <- patt[!duplicated(patt$genes), ]
+pattern <- as.matrix(patt$logFC)
+rownames(pattern) <- patt$genes
+colnames(pattern) <- "Gas.Dis"
+NMF2SC <- projectR(mydat, loadings = pattern, full=TRUE)
+
+sce$Gas.Dis.projection.weight <- NMF2SC$projection
+plotTSNE(sce, colour_by = "Gas.Dis.projection.weight")
+
+proj <- as.data.frame(colData(sce)[,c("cluster.k5", "Gas.Dis.projection.weight", "annotation")])
+ggplot(proj, aes(x = cluster.k5, y = Gas.Dis.projection.weight, col = annotation)) + geom_boxplot()
+
+pattern.onehot <- ifelse(pattern[,1] > 0, 1, 0) 
+pattern.onehot <- as.matrix(pattern.onehot)
+colnames(pattern.onehot) <- "Gas.Dis"
+NMF2SC.onehot <- projectR(mydat, loadings = pattern.onehot, full=TRUE)
+
+sce$pattern.onehot.Gas.Dis.projection.weight <- NMF2SC.onehot$projection
+plotTSNE(sce, colour_by = "pattern.onehot.Gas.Dis.projection.weight")
+proj.onehot <- as.data.frame(colData(sce)[,c("cluster.k5", "pattern.onehot.Gas.Dis.projection.weight", "annotation")])
+
+ggplot(proj, aes(x = cluster.k5, y = Gas.Dis.projection.weight, col = annotation)) + geom_boxplot()
+ggplot(proj.onehot, aes(x = cluster.k5, y = pattern.onehot.Gas.Dis.projection.weight, col = annotation)) + geom_boxplot()
+
+gas_genes <- pattern[pattern > 0, ]
+gas_genes <- gas_genes[names(gas_genes) %in% rownames(sce)]
+plotHeatmap(sce, names(gas_genes), colour_columns_by = c("cluster.k5"), show_colnames = FALSE, clustering_method = 'ward.D2', fontsize_row = 2)
+```
+
+
+```{r}
+sce <- readRDS(here::here("data", "sce.Vagal_WholeNodoseSeq_10X.rds"))
+
+saveRDS(sce, here::here("10x", "sce.Vagal_WholeNodoseSeq_10X.includes_glia_etc.rds"))
+
+saveRDS(sce, here::here("10x", "sce.Vagal_WholeNodoseSeq_10X.final.rds"))
+sce <- readRDS(here::here("10x", "sce.Vagal_WholeNodoseSeq_10X.final.rds"))
+```

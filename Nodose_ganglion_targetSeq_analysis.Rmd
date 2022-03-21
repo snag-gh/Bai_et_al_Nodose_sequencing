@@ -1,0 +1,417 @@
+---
+title: "Bai et al Nodose ganglion targetSeq analysis"
+author: "Sushma Nagaraj"
+date: "2/24/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressPackageStartupMessages({
+  library(GEOquery)
+  library(Matrix)
+  library(tximeta)
+  library(SummarizedExperiment)
+  library(SingleCellExperiment)
+  library(rtracklayer)
+  library(scater)
+  library(scran)
+  library(DropletUtils)
+  library(stringr)
+  library(cowplot)
+})
+
+here::i_am("src/Bai_Nodose_ganglion/Nodose_ganglion_targetSeq_analysis.Rmd")
+source("/home/sushmanagaraj/src/devel/R/SingleCell/functions/functions.R")
+```
+
+#Get project metadata and any raw data from GEO.
+```{r}
+gse <- getGEO("GSE138651")
+show(gse)
+show(pData(phenoData(gse[[1]])))
+sample_metadata <- pData(phenoData(gse[[1]]))
+write.csv(sample_metadata, file = here::here("data", "sample_metadata.csv"))
+getGEOSuppFiles("GSE138651", baseDir = here::here("data")) 
+```
+
+#The targetSeq counts file contains the retrograde tracing info. 
+```{r}
+files <- list.files(here::here("data", "GSE138651"))
+zz <- gzfile(here::here("data", "GSE138651", "GSE138651_NGTall_Reads_cap.csv.gz"), 'rt')
+target_seq <- read.csv(zz, header = TRUE) 
+```
+
+#Create Single cell object for the targetSeq.
+```{r}
+#Put together SRR to sample mapping
+sample_metadata <- read.csv(here::here("data", "sample_metadata.csv"), header = TRUE)
+sra_table <- read.csv(here::here("data", "SraRunTable.txt"), header = TRUE)
+SRR_GSM_mapping <- sra_table[,c("Run", "Sample.Name")]
+SRR_GSM_mapping$title <- sample_metadata[match(SRR_GSM_mapping$Sample.Name, sample_metadata$geo_accession), "title"] 
+
+#Read in salmon quantification and create single cell object
+alndir <- "/data/users/sushmanagaraj/projects/singlecell/Bai_Nodose_ganglion/salmon"
+files <- data.frame(files = file.path(alndir, SRR_GSM_mapping$Run[-1], "quant.sf"), names = SRR_GSM_mapping$title[-1])
+table(file.exists(files$files))
+se <- tximeta(files, skipSeqinfo=TRUE)
+assayNames(se)
+rowRanges(se)
+seqinfo(se)
+gse <- summarizeToGene(se, countsFromAbundance = "scaledTPM")
+metadata(gse)$countsFromAbundance 
+sce <- as(gse, "SingleCellExperiment")
+
+#Add gene metadata
+rowData(sce)$chr <- as.character(seqnames(rowRanges(sce)))
+
+my_file <- "/data/users/sushmanagaraj/ref/mm/vM25/gencode.vM25.annotation.gtf"
+my_obj <- import(my_file)
+temp <- my_obj@elementMetadata
+gn <- temp[temp$type == "gene", c("gene_id", "gene_name")]
+rowData(sce)$gene_name <- gn[match(rowData(sce)$gene_id, gn$gene_id), "gene_name"]
+rowData(sce)$gene_id_trimmed <- str_sub(rowData(sce)$gene_id, 1, 18) 
+
+rownames(sce) <- uniquifyFeatureNames(rowData(sce)$gene_id_trimmed, rowData(sce)$gene_name)
+
+#Add sample metadata
+meta <- as.data.frame(t(target_seq[1:3, ]))
+meta <- meta[-which(rownames(meta) == "X"),]
+meta$'4' <- rownames(meta) 
+colnames(meta) <- meta[1,]
+meta <- meta[-which(rownames(meta) == "Sample.ID"),]
+rownames(meta)[which(rownames(meta) == "ND145")] <- "ND154" #Discrepancy in the sample names between metadata and datatable.
+all.equal(rownames(meta), meta$Sample.ID)
+meta$Sample.ID <- rownames(meta)
+meta <- meta[sce$names, ]
+all.equal(colnames(sce), rownames(meta))
+
+colData(sce) <- cbind(colData(sce), meta)
+saveRDS(sce, here::here("data", "sce.targetSeq.rds"))
+```
+
+#QC
+```{r}
+is.mito <- which(rowData(sce)$chr == "chrM")
+sce <- addPerCellQC(sce, subsets = list(Mito = is.mito))
+stats <- colData(sce)
+
+ggplot(as.data.frame(colData(sce)), aes(x = subsets_Mito_percent)) + geom_density()
+
+reasons <- quickPerCellQC(stats, percent_subsets=c("subsets_Mito_percent"))
+colSums(as.data.frame(reasons))
+sce$discard <- reasons$discard
+detected.discard <- isOutlier(sce$detected, nmads = 5, type = "lower", log = TRUE)
+table(detected.discard)
+attr(detected.discard, "thresholds")
+sce$detected.discard <- detected.discard
+
+pdf(here::here("targetSeq", "qc_plots.pdf"))
+plot_grid(
+plotColData(sce, "sum", colour_by = "discard"),
+plotColData(sce, "detected", colour_by = "discard"),
+plotColData(sce, "subsets_Mito_percent", colour_by = "discard"),
+plotColData(sce, x = "sum", y = "detected", colour_by = "discard"),
+
+plotColData(sce, "sum", colour_by = "detected.discard"),
+plotColData(sce, "detected", colour_by = "detected.discard"),
+plotColData(sce, "subsets_Mito_percent", colour_by = "detected.discard"),
+plotColData(sce, x = "sum", y = "detected", colour_by = "detected.discard"), nrow = 4, ncol = 2)
+dev.off()
+
+sce <- sce[,!sce$detected.discard]
+```
+
+#Normalization
+```{r normalization}
+sce <- computeSumFactors(sce)
+sce <- logNormCounts(sce)
+summary(sizeFactors(sce))
+plot(librarySizeFactors(sce), sizeFactors(sce), pch = 16, xlab = "library size factors", ylab = "Deconvolution factors", log = "xy")
+```
+
+#Variance modeling
+```{r}
+dec <- modelGeneVar(sce)
+hv <- dec[dec$total >= 1, ]
+plot(dec$mean, dec$total, pch = 16, cex = 0.5, xlab = "Mean of log-expression", ylab = "Variance of log-expression")
+text(hv$mean, hv$total, row.names(hv), cex = 0.7)
+curfit <- metadata(dec)
+curve(curfit$trend(x), col = "dodgerblue", add = TRUE, lwd = 2)
+
+chosen.hvgs <- getTopHVGs(dec, prop = 0.2)
+```
+
+#Dimentionality reduction
+```{r}
+sce <- runPCA(sce, subset_row = chosen.hvgs) 
+
+set.seed(1111001)
+sce <- runTSNE(sce, dimred = "PCA")
+tsne <- plotTSNE(sce, colour_by = "Mouse ID")
+
+set.seed(1100101001)
+sce <- runUMAP(sce, dimred = "PCA")
+umap <- plotUMAP(sce, colour_by = "Mouse ID")
+
+pdf(here::here("targetSeq", "TSNE_UMAP.by_mouse.pdf"))
+cowplot::plot_grid(tsne, umap, nrow = 2)
+dev.off()
+```
+
+#Clustering
+```{r clustering}
+g <- buildSNNGraph(sce, k = 10, use.dimred = "PCA")
+clust <- igraph::cluster_louvain(g)$membership
+table(clust)
+sce$cluster.k10 <- factor(clust)
+
+plotTSNE(sce, colour_by = "cluster.k10")
+plotTSNE(sce, colour_by = "Target ID")
+```
+
+#Marker genes from Bai et al
+```{r}
+plotTSNE(sce, colour_by = "Edn3")
+plotTSNE(sce, colour_by = "Sst")
+plotTSNE(sce, colour_by = "Calca")
+plotTSNE(sce, colour_by = "Oxtr")
+plotTSNE(sce, colour_by = "Olfr78")
+plotTSNE(sce, colour_by = "Ebf3")
+plotTSNE(sce, colour_by = "Npas1")
+plotTSNE(sce, colour_by = "Prom1")
+plotTSNE(sce, colour_by = "Caln1")
+plotTSNE(sce, colour_by = "Areg")
+plotTSNE(sce, colour_by = "Edn3")
+plotTSNE(sce, colour_by = "Prom1")
+plotTSNE(sce, colour_by = "Sdc1")
+plotTSNE(sce, colour_by = "Sprr1a")
+plotTSNE(sce, colour_by = "Ecel1")
+plotTSNE(sce, colour_by = "Tac1")
+
+pdf(here::here("targetSeq", "marker_genes.violin_plots.pdf"))
+plotExpression(sce, features = c("Glp1r", "Gpr65", "C1ql3", "Ctxn2", "Agtr1a", "Oxtr", "Olfr78", "Npas1", "Sst", "Calca", "Vip", "Uts2b", "Cbln4", "Prom1", "Lpar3", "Areg", "Caln1", "Edn3", "Disp3", "Dbh", "Crhr2", "Ebf3"), x = I(as.factor(sce$cluster.k10)), colour_by = I(as.factor(sce$cluster.k10)), point_size = 0, show_violin = TRUE)
+dev.off()
+
+
+sce$map_to_Bai[sce$cluster.k10 == 1] <- "t04.t05"
+sce$map_to_Bai[sce$cluster.k10 == 2] <- "t03.t07"
+sce$map_to_Bai[sce$cluster.k10 == 3] <- "t012"
+sce$map_to_Bai[sce$cluster.k10 == 4] <- "t01.t02"
+sce$map_to_Bai[sce$cluster.k10 == 5] <- "t08.t09"
+sce$map_to_Bai[sce$cluster.k10 == 6] <- "t06"
+sce$map_to_Bai[sce$cluster.k10 == 7] <- "injured.cells"
+
+pdf(here::here("targetSeq", "cluster.k10", "TSNE.annotated.pdf"))
+plot_grid(
+plotTSNE(sce, colour_by = "cluster.k10", text_by = "cluster.k10"),
+plotTSNE(sce, colour_by = "Target ID", text_by = "cluster.k10"),
+plotTSNE(sce, colour_by = "map_to_Bai", text_by = "map_to_Bai"),
+ncol = 2)
+dev.off()
+```
+
+#Find Marker genes
+```{r marker_genes}
+markers <- findMarkers(sce, sce$cluster.k10, direction = "up")
+
+genes5 <- lapply(markers, function(x) {rownames(x)[x$Top <= 10]})
+genes5 <- unique(unlist(genes5))
+
+pdf(here::here("targetSeq", "cluster.k10", "markers_heatmap.pdf"))
+plotHeatmap(sce, genes5, colour_columns_by = c("cluster.k10"), show_colnames = FALSE, clustering_method = 'ward.D2', fontsize_row = 2)
+dev.off()
+```
+
+#Remove injured cells and recluster
+```{r}
+sce.final <- sce[,sce$map_to_Bai != "injured.cells"]
+dec <- modelGeneVar(sce.final)
+hv <- dec[dec$total >= 1, ]
+plot(dec$mean, dec$total, pch = 16, cex = 0.5, xlab = "Mean of log-expression", ylab = "Variance of log-expression")
+text(hv$mean, hv$total, row.names(hv), cex = 0.7)
+curfit <- metadata(dec)
+curve(curfit$trend(x), col = "dodgerblue", add = TRUE, lwd = 2)
+
+chosen.hvgs <- getTopHVGs(dec, prop = 0.2)
+glial_genes <- read.table(here::here("10x", "cluster.k10", "glial_genes.cluster9.txt"))
+chosen.hvgs <- chosen.hvgs[!chosen.hvgs %in% glial_genes$x]
+
+sce.final <- runPCA(sce.final, subset_row = chosen.hvgs) 
+set.seed(1111001)
+sce.final <- runTSNE(sce.final, dimred = "PCA")
+tsne <- plotTSNE(sce.final, colour_by = "Target ID")
+set.seed(1100101001)
+sce.final <- runUMAP(sce.final, dimred = "PCA")
+umap <- plotUMAP(sce.final, colour_by = "Target ID")
+cowplot::plot_grid(tsne, umap, nrow = 2)
+
+g <- buildSNNGraph(sce.final, k = 3, use.dimred = "PCA")
+clust <- igraph::cluster_louvain(g)$membership
+table(clust)
+sce.final$cluster.k3 <- factor(clust)
+
+
+#sce.final$map_to_Bai_refined[sce.final$cluster.k5 == 1] <- "t05"
+#sce.final$map_to_Bai_refined[sce.final$cluster.k5 == 2] <- "t03.t07"
+#sce.final$map_to_Bai_refined[sce.final$cluster.k5 == 3] <- "t01"
+#sce.final$map_to_Bai_refined[sce.final$cluster.k5 == 4] <- "unknown"
+#sce.final$map_to_Bai_refined[sce.final$cluster.k5 == 5] <- "t04"
+#sce.final$map_to_Bai_refined[sce.final$cluster.k5 == 6] <- "t02"
+#sce.final$map_to_Bai_refined[sce.final$cluster.k5 == 7] <- "t12.t11" 
+#sce.final$map_to_Bai_refined[sce.final$cluster.k5 == 8] <- "t09.t10"
+#sce.final$map_to_Bai_refined[sce.final$cluster.k5 == 9] <- "t06"
+
+sce.final$map_to_Bai_refined[sce.final$cluster.k3 == 1] <- "t4"
+sce.final$map_to_Bai_refined[sce.final$cluster.k3 == 2] <- "t5"
+sce.final$map_to_Bai_refined[sce.final$cluster.k3 == 3] <- "t1"
+sce.final$map_to_Bai_refined[sce.final$cluster.k3 == 4] <- "t2"
+sce.final$map_to_Bai_refined[sce.final$cluster.k3 == 5] <- "t1"
+sce.final$map_to_Bai_refined[sce.final$cluster.k3 == 6] <- "t8"
+sce.final$map_to_Bai_refined[sce.final$cluster.k3 == 7] <- "t6" 
+sce.final$map_to_Bai_refined[sce.final$cluster.k3 == 8] <- "t10.t11.t12"
+sce.final$map_to_Bai_refined[sce.final$cluster.k3 == 9] <- "t3.t7"
+sce.final$map_to_Bai_refined[sce.final$cluster.k3 == 10] <- "t10.t11.t12"
+sce.final$map_to_Bai_refined[sce.final$cluster.k3 == 11] <- "t9"
+sce.final$map_to_Bai_refined[sce.final$cluster.k3 == 12] <- "t3.t7"
+
+pdf(here::here("targetSeq", "subset_cluster.k3", "TSNE.annotated.pdf"))
+plot_grid(
+  plotTSNE(sce.final, colour_by = "cluster.k3"),
+  plotTSNE(sce.final, colour_by = "map_to_Bai_refined"),
+  plotTSNE(sce.final, colour_by = "Target ID"),
+  nrow = 2)
+dev.off()
+
+plotTSNE(sce.final, colour_by = "cluster.k3")
+plotTSNE(sce.final, colour_by = "Target ID")
+plotTSNE(sce.final, colour_by = "map_to_Bai_refined")
+plotTSNE(sce.final, colour_by = "Calca")
+plotTSNE(sce.final, colour_by = "Npas1")
+plotTSNE(sce.final, colour_by = "Prom1")
+plotTSNE(sce.final, colour_by = "Lpar3")
+plotTSNE(sce.final, colour_by = "Caln1")
+plotTSNE(sce.final, colour_by = "Areg")
+plotTSNE(sce.final, colour_by = "Dbh")
+plotTSNE(sce.final, colour_by = "Edn3")
+plotTSNE(sce.final, colour_by = "Disp3")
+plotTSNE(sce.final, colour_by = "Ebf3")
+plotTSNE(sce.final, colour_by = "Crhr2")
+plotTSNE(sce.final, colour_by = "Gabra5")
+plotTSNE(sce.final, colour_by = "Apoe")
+plotTSNE(sce.final, colour_by = "Sox10")
+plotTSNE(sce.final, colour_by = "Cdh19")
+plotTSNE(sce.final, colour_by = "Sst")
+
+markers <- findMarkers(sce.final, sce.final$cluster.k5, direction = "up", test = "binom")
+
+#Subsluster clusters 9,12
+cluster9 <- sce.final[,sce.final$cluster.k3 %in% c("9", "12")]
+dec <- modelGeneVar(cluster9)
+chosen.hvgs <- getTopHVGs(dec, n = 1000)
+chosen.hvgs <- chosen.hvgs[!chosen.hvgs %in% glial_genes$x]
+cluster9 <- runPCA(cluster9, subset_row = chosen.hvgs)
+set.seed(1101100)
+cluster9 <- runTSNE(cluster9, dimred = "PCA")
+g <- buildSNNGraph(cluster9, k = 10, use.dimred = "PCA")
+clust <- igraph::cluster_louvain(g)$membership
+table(clust)
+cluster9$cluster.k10 <- factor(clust)
+
+plotTSNE(cluster9, colour_by = "cluster.k10")
+plotTSNE(cluster9, colour_by = "Npas1")
+plotTSNE(cluster9, colour_by = "Prom1")
+plotTSNE(cluster9, colour_by = "Lpar3")
+plotTSNE(cluster9, colour_by = "Target ID")
+
+cluster9$ann[cluster9$cluster.k10 == 2] <- "t3"
+cluster9$ann[cluster9$cluster.k10 == 1] <- "t7"
+
+sce.final$map_to_Bai_refined[colnames(sce.final) %in% colnames(cluster9)[cluster9$ann == "t3"]] <- "t3"
+sce.final$map_to_Bai_refined[colnames(sce.final) %in% colnames(cluster9)[cluster9$ann == "t7"]] <- "t7"
+
+#subcluster clusters 8,10
+cluster8 <- sce.final[,sce.final$cluster.k3 %in% c("8", "10")]
+dec <- modelGeneVar(cluster8)
+chosen.hvgs <- getTopHVGs(dec, n = 1000)
+chosen.hvgs <- chosen.hvgs[!chosen.hvgs %in% glial_genes$x]
+cluster8 <- runPCA(cluster8, subset_row = chosen.hvgs)
+set.seed(1101100)
+cluster8 <- runTSNE(cluster8, dimred = "PCA")
+g <- buildSNNGraph(cluster8, k = 4, use.dimred = "PCA")
+clust <- igraph::cluster_louvain(g)$membership
+table(clust)
+cluster8$cluster.k4 <- factor(clust)
+
+plotTSNE(cluster8, colour_by = "cluster.k4")
+plotTSNE(cluster8, colour_by = "Gpr65")
+plotTSNE(cluster8, colour_by = "Disp3")
+plotTSNE(cluster8, colour_by = "Dbh")
+plotTSNE(cluster8, colour_by = "Crhr2")
+plotTSNE(cluster8, colour_by = "Ebf3")
+plotTSNE(cluster8, colour_by = "Target ID")
+
+cluster8$ann[cluster8$cluster.k4 == 1] <- "t12"
+cluster8$ann[cluster8$cluster.k4 == 2] <- "t11"
+cluster8$ann[cluster8$cluster.k4 == 3] <- "t10"
+
+sce.final$map_to_Bai_refined[colnames(sce.final) %in% colnames(cluster8)[cluster8$ann == "t10"]] <- "t10"
+sce.final$map_to_Bai_refined[colnames(sce.final) %in% colnames(cluster8)[cluster8$ann == "t11"]] <- "t11"
+sce.final$map_to_Bai_refined[colnames(sce.final) %in% colnames(cluster8)[cluster8$ann == "t12"]] <- "t12"
+
+sce.final$map_to_Bai_refined <- factor(sce.final$map_to_Bai_refined, levels = c("t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10", "t11", "t12"))
+pdf(here::here("targetSeq", "subset_cluster.k3", "marker_genes.violin_plots.pdf"))
+plotExpression(sce.final, features = c("Glp1r", "Gpr65", "C1ql3", "Ctxn2", "Agtr1a", "Oxtr", "Olfr78", "Npas1", "Sst", "Calca", "Vip", "Uts2b", "Cbln4", "Prom1", "Lpar3", "Areg", "Caln1", "Edn3", "Disp3", "Dbh", "Crhr2", "Ebf3"), x = I(as.factor(sce.final$cluster.k3)), colour_by = I(as.factor(sce.final$cluster.k3)), point_size = 0, show_violin = TRUE)
+plotExpression(sce.final, features = c("Glp1r", "Gpr65", "C1ql3", "Ctxn2", "Agtr1a", "Oxtr", "Olfr78", "Npas1", "Sst", "Calca", "Vip", "Uts2b", "Cbln4", "Prom1", "Lpar3", "Areg", "Caln1", "Edn3", "Disp3", "Dbh", "Crhr2", "Ebf3"), x = I(as.factor(sce.final$map_to_Bai_refined)), colour_by = I(as.factor(sce.final$map_to_Bai_refined)), point_size = 0, show_violin = TRUE)
+dev.off()
+```
+#Compare the cells from different targets without clustering
+```{r}
+sce$Region <- sce$`Target ID`
+sce$Region[sce$`Target ID` %in% c("GastG", "GastP")] <- "Stomach"
+sce$Region[sce$`Target ID` %in% c("IntD", "IntM", "IntP")] <- "IntestinePMD"
+
+plotUMAP(sce, colour_by = "Region")
+plotUMAP(sce, colour_by = "Cacna1e")
+plotUMAP(sce, colour_by = "Mouse ID")
+
+sce <- sce[,sce$Region != "na"]
+target.markers <- findMarkers(sce, sce$Region)
+
+top <- vector("list", length(target.markers))
+top <- lapply(names(target.markers), function(x) {
+  c <- target.markers[[x]]
+  c200 <- c[1:200, ]
+  colnames(c200) <- paste0(colnames(c200), ".", x)
+  c200$Gene <- rownames(c200)
+  rownames(c200) <- NULL
+  #c200 <- c200[,c("Gene", "FDR", "summary.logFC")]
+  return(c200)
+}) 
+names(top) <- names(target.markers)
+merged <- Reduce(function(x, y) merge(x, y, all = TRUE, by = "Gene"), top)
+
+sce$Region <- as.factor(sce$Region)
+avgs <- vector("list", length = length(levels(sce$Region)))
+avgs <- lapply(levels(sce$Region), function(x) {clustAvg(x, sce, "Region")})
+merged.avgs <- Reduce(function(x, y) merge(x, y, all = TRUE, by = "gene"), avgs)
+
+merged.avgs <- merged.avgs[merged.avgs$gene %in% merged$Gene, ]
+rownames(merged.avgs) <- merged.avgs$gene
+merged.avgs <- merged.avgs[merged$Gene, ]
+all.equal(merged.avgs$gene, merged$Gene)
+
+merged <- cbind(merged, merged.avgs)
+write.csv(merged, file = here::here("targetSeq", "topGenes.markers_for_targets.csv"))
+
+```
+
+#Save
+```{r}
+saveRDS(sce, here::here("data", "sce.targetSeq.rds"))
+
+saveRDS(sce, here::here("targetSeq", "sce.targetSeq.rds"))
+
+saveRDS(sce.final, here::here("targetSeq", "sce.targetSeq.final.rds"))
+sce <- readRDS(here::here("targetSeq", "sce.targetSeq.final.rds"))
+```
