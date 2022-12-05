@@ -264,8 +264,8 @@ write.csv(topgenes, file = here::here("integrated_analysis", "cluster.k3", "topg
 ```{r}
 markers.2 <- findMarkers(sce, sce$region_projecting, block = sce$batch, BPPARAM = BiocParallel::MulticoreParam(5))
 subd.markers <- markers.2[["Subdiaphragmatic"]]
-subd.markers <- subd.markers[subd.markers$FDR <= 0.05 & abs(subd.markers$summary.logFC) >=1, ]
-subd.markers.gastric <- subd.markers[rownames(subd.markers) %in% patt$genes[abs(patt$logFC) >=1], ]
+subd.markers <- subd.markers[subd.markers$FDR <= 0.05, ]
+subd.markers.gastric <- subd.markers[rownames(subd.markers) %in% patt$genes, ]
 
 col_order <- c("n1.n27", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n21", "n14.n26", "n25", "n9", "n10", "n11", "n12", "n13", "n16", "n17.n18", "n19", "n20", "n22", "n23", "n24")
 col <- c('#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4', '#46f0f0', '#f032e6', '#bcf60c', '#fabebe', '#008080', '#e6beff', '#9a6324', '#046c9a', '#800000', '#cc3a1b', '#808000', '#4cabdc', '#808080', '#ebcb2e', '#00ccff', "#ebcb2e", "#9ec22f", "#a9961b", "#cc3a1b", "#cc8778", "#999999", "#E69F00", "#56B4E9", "#009E73")
@@ -347,6 +347,7 @@ gas_genes <- pattern[pattern > 0, ]
 gas_genes <- gas_genes[names(gas_genes) %in% rownames(sce)]
 plotHeatmap(sce, names(gas_genes), colour_columns_by = c("cluster.k5"), show_colnames = FALSE, clustering_method = 'ward.D2', fontsize_row = 2)
 ```
+
 #AUCell
 ```{r}
 #The cells from the 2 datasets have different distributions of genes detected

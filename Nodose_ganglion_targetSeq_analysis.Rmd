@@ -365,6 +365,7 @@ plotExpression(sce.final, features = c("Glp1r", "Gpr65", "C1ql3", "Ctxn2", "Agtr
 plotExpression(sce.final, features = c("Glp1r", "Gpr65", "C1ql3", "Ctxn2", "Agtr1a", "Oxtr", "Olfr78", "Npas1", "Sst", "Calca", "Vip", "Uts2b", "Cbln4", "Prom1", "Lpar3", "Areg", "Caln1", "Edn3", "Disp3", "Dbh", "Crhr2", "Ebf3"), x = I(as.factor(sce.final$map_to_Bai_refined)), colour_by = I(as.factor(sce.final$map_to_Bai_refined)), point_size = 0, show_violin = TRUE)
 dev.off()
 ```
+
 #Compare the cells from different targets without clustering
 ```{r}
 sce$Region <- sce$`Target ID`
